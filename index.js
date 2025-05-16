@@ -27,16 +27,12 @@ app.get('/authUri', (req, res) => {
   res.redirect(authUri);
 });
 
-// Step 2: Handle the OAuth2 callback
+// Step 2: Handle the OAuth2 callback and redirect to dashboard
 app.get('/callback', async (req, res) => {
   try {
     const parseRedirect = await oauthClient.createToken(req.url);
-    // Save tokens as needed (for now, just show them)
-    res.send(`
-      <h2>Authorization Successful!</h2>
-      <pre>${JSON.stringify(parseRedirect.getJson(), null, 2)}</pre>
-      <p>Copy your access and refresh tokens for use in API calls.</p>
-    `);
+    // Optionally, you can store tokens here if needed
+    res.redirect('https://webapp-database-97dfe.web.app/insurance-html-template/Dashboard.html');
   } catch (e) {
     res.status(500).send('OAuth callback error: ' + e.message);
   }
