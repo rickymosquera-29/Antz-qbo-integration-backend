@@ -32,11 +32,11 @@ app.get('/callback', async (req, res) => {
   try {
     const parseRedirect = await oauthClient.createToken(req.url);
     // Optionally, you can store tokens here if needed
-    res.redirect('https://webapp-database-97dfe.web.app/insurance-html-template/Dashboard.html');
+    res.redirect('https://webapp-database-97dfe.web.app/Dashboard.html');
   } catch (e) {
     res.status(500).send('OAuth callback error: ' + e.message);
   }
-});
+}); 
 
 // Test endpoint to create a customer in QBO
 app.post('/create-customer', async (req, res) => {
