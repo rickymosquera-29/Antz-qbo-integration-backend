@@ -2,8 +2,10 @@ require('dotenv').config();
 const express = require('express');
 const IntuitOAuth = require('intuit-oauth');
 const axios = require('axios');
-const app = express();
+const cors = require('cors');
 
+const app = express();
+app.use(cors());
 app.use(express.json());
 
 app.get('/', (req, res) => {
@@ -27,16 +29,27 @@ app.get('/authUri', (req, res) => {
   res.redirect(authUri);
 });
 
-// Step 2: Handle the OAuth2 callback and redirect to dashboard
-app.get('/callback', async (req, res) => {
-  try {
-    const parseRedirect = await oauthClient.createToken(req.url);
-    // Optionally, you can store tokens here if needed
-    res.redirect('https://webapp-database-97dfe.web.app/Dashboard.html');
-  } catch (e) {
-    res.status(500).send('OAuth callback error: ' + e.message);
-  }
-}); 
+// Step 2: Handle the OAuth2 callback and show popup success (NO redirect to dashboard)
+app.get('/callback', (req, res) => {
+  res.send(`
+    <html>
+      <body>
+        <h1>QuickBooks Connected Successfully!</h1>
+        <p>You can close this window and return to the dashboard.</p>
+        <script>
+          if (window.opener) {
+            window.opener.postMessage({
+              type: 'qbo_connected',
+              code: '${req.query.code || ''}',
+              realmId: '${req.query.realmId || ''}'
+            }, '*');
+          }
+          setTimeout(() => window.close(), 3000);
+        </script>
+      </body>
+    </html>
+  `);
+});
 
 // Test endpoint to create a customer in QBO
 app.post('/create-customer', async (req, res) => {
@@ -49,7 +62,7 @@ app.post('/create-customer', async (req, res) => {
     };
 
     const response = await axios.post(
-      `https://sandbox-quickbooks.api.intuit.com/v3/company/${realmId}/customer`,
+      `https://sandbox-quickbooks.api.intuit.com/v3/company/9341454666511557/customer`,
       customerPayload,
       {
         headers: {
@@ -66,29 +79,35 @@ app.post('/create-customer', async (req, res) => {
   }
 });
 
+
+
 // Test endpoint to create an invoice in QBO
 app.post('/create-invoice', async (req, res) => {
   try {
     const { access_token, realmId } = req.body;
 
-    // Minimal invoice payload for testing
+    const customerId = "59";
+    const itemId = "21";
+
     const invoicePayload = {
-      CustomerRef: { value: "1" }, // Use a real customer ID if available
+      CustomerRef: { value: customerId },
       Line: [
         {
           Amount: 100,
           DetailType: "SalesItemLineDetail",
           SalesItemLineDetail: {
-            ItemRef: { value: "1" }, // Use a real item ID if available
+            ItemRef: { value: itemId },
             Qty: 1,
-            UnitPrice: 100
+            UnitPrice: 100,
+            TaxCodeRef: { value: "TAX" }
           }
         }
       ]
     };
-
+    
+    console.log("QBO Access Token (before API call):", access_token);
     const response = await axios.post(
-      `https://sandbox-quickbooks.api.intuit.com/v3/company/${realmId}/invoice`,
+      `https://sandbox-quickbooks.api.intuit.com/v3/company/9341454666511557/invoice`,
       invoicePayload,
       {
         headers: {
@@ -101,6 +120,7 @@ app.post('/create-invoice', async (req, res) => {
 
     res.json(response.data);
   } catch (err) {
+    console.error('QBO Error:', err.response?.data || err.message);
     res.status(500).json({ error: err.message, details: err.response?.data });
   }
 });
@@ -108,12 +128,25 @@ app.post('/create-invoice', async (req, res) => {
 // Real integration endpoint for syncing policy data as an invoice
 app.post('/sync-policy-invoice', async (req, res) => {
   try {
-    const { access_token, realmId, customer, invoice } = req.body;
+    let { qboAuthCode, invoice, realmId } = req.body;
+    if (!invoice || !Array.isArray(invoice.coverages) || !Array.isArray(invoice.charges)) {
+      return res.status(400).json({ error: "Invalid invoice data. 'coverages' and 'charges' arrays are required." });
+    }
 
-    // 1. Create or find the customer in QBO (for now, use a default customer ID "1" for testing)
-    // In production, you would search for the customer or create them if they don't exist.
+    // Exchange auth code for access token
+    const oauthClientLocal = new IntuitOAuth({
+      clientId: process.env.QB_CLIENT_ID,
+      clientSecret: process.env.QB_CLIENT_SECRET,
+      environment: process.env.QB_ENVIRONMENT,
+      redirectUri: process.env.QB_REDIRECT_URI
+    });
 
-    // 2. Map coverages and charges to QBO invoice line items
+    const tokenResponse = await oauthClientLocal.createToken(`?code=${qboAuthCode}&state=testState`);
+    const access_token = tokenResponse.getJson().access_token;
+    console.log("QBO Access Token:", access_token);
+    // Use realmId from the request body
+
+    // 1. Map coverages and charges to QBO invoice line items
     const lineItems = [];
 
     // Add coverages as line items
@@ -123,7 +156,7 @@ app.post('/sync-policy-invoice', async (req, res) => {
         DetailType: "SalesItemLineDetail",
         Description: cov.type,
         SalesItemLineDetail: {
-          ItemRef: { value: "1" }, // Use a real item ID in production
+          ItemRef: { value: "21" }, // Use a real item ID in production
           Qty: 1,
           UnitPrice: cov.premium,
           TaxCodeRef: { value: "TAX" }
@@ -138,7 +171,7 @@ app.post('/sync-policy-invoice', async (req, res) => {
         DetailType: "SalesItemLineDetail",
         Description: charge.type,
         SalesItemLineDetail: {
-          ItemRef: { value: "1" }, // Use a real item ID in production
+          ItemRef: { value: "21" }, // Use a real item ID in production
           Qty: 1,
           UnitPrice: charge.amount,
           TaxCodeRef: { value: "TAX" }
@@ -146,17 +179,50 @@ app.post('/sync-policy-invoice', async (req, res) => {
       });
     });
 
-    // 3. Build the invoice payload
+    // --- CUSTOMER LOGIC START ---
+    const customerName = invoice.assured || 'Unknown Customer';
+    let customerId = null;
+    // Search for customer in QBO
+    const query = `select * from Customer where DisplayName = '${customerName.replace(/'/g, "\\'")}'`;
+    const customerQueryResp = await axios.get(
+      `https://sandbox-quickbooks.api.intuit.com/v3/company/${realmId}/query?query=${encodeURIComponent(query)}`,
+      {
+        headers: {
+          Authorization: `Bearer ${access_token}`,
+          'Content-Type': 'application/text',
+          Accept: 'application/json'
+        }
+      }
+    );
+    if (customerQueryResp.data.QueryResponse.Customer && customerQueryResp.data.QueryResponse.Customer.length > 0) {
+      // Customer exists
+      customerId = customerQueryResp.data.QueryResponse.Customer[0].Id;
+    } else {
+      // Customer does not exist, create it
+      const createCustomerResp = await axios.post(
+        `https://sandbox-quickbooks.api.intuit.com/v3/company/${realmId}/customer`,
+        { DisplayName: customerName },
+        {
+          headers: {
+            Authorization: `Bearer ${access_token}`,
+            'Content-Type': 'application/json',
+            Accept: 'application/json'
+          }
+        }
+      );
+      customerId = createCustomerResp.data.Customer.Id;
+    }
+    // --- CUSTOMER LOGIC END ---
+
+    // 2. Build the invoice payload
     const invoicePayload = {
-      CustomerRef: { value: "1" }, // Use a real customer ID in production
+      CustomerRef: { value: customerId },
       Line: lineItems,
-      TxnDate: invoice.dateIssued,
-      DueDate: invoice.expiryDate,
-      PrivateNote: `Policy No: ${invoice.policyNumber}, Quote ID: ${invoice.quoteId}, Agent: ${invoice.agent}`,
-      // You can add more fields as needed
+      TxnDate: invoice.dateIssued || undefined,
+      PrivateNote: `PDF: ${req.body.fileName || ''} | QUOTE ID: ${invoice.quoteId || ''} | POL NO: ${invoice.policyNumber || ''} | ASSURED: ${invoice.assured || ''} | ADDRESS: ${invoice.address || ''} | DATE_ISSUED: ${invoice.dateIssued || ''} | INCEP_DATE: ${invoice.incepDate || ''} | AGENCY: ${invoice.agency || ''} | AGENT: ${invoice.agent || ''} | PREPARED BY: ${invoice.preparedBy || ''}`
     };
 
-    // 4. Send the invoice to QBO
+    // 3. Send the invoice to QBO
     const response = await axios.post(
       `https://sandbox-quickbooks.api.intuit.com/v3/company/${realmId}/invoice`,
       invoicePayload,
@@ -169,8 +235,14 @@ app.post('/sync-policy-invoice', async (req, res) => {
       }
     );
 
-    res.json(response.data);
+    // Return invoice data + customer info for frontend to store
+    res.json({
+      ...response.data,
+      customerName: customerName,
+      customerId: customerId
+    });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message, details: err.response?.data });
   }
 });
