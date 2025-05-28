@@ -29,26 +29,41 @@ app.get('/authUri', (req, res) => {
   res.redirect(authUri);
 });
 
-// Step 2: Handle the OAuth2 callback and show popup success (NO redirect to dashboard)
-app.get('/callback', (req, res) => {
-  res.send(`
-    <html>
-      <body>
-        <h1>QuickBooks Connected Successfully!</h1>
-        <p>You can close this window and return to the dashboard.</p>
-        <script>
-          if (window.opener) {
-            window.opener.postMessage({
-              type: 'qbo_connected',
-              code: '${req.query.code || ''}',
-              realmId: '${req.query.realmId || ''}'
-            }, '*');
-          }
-          setTimeout(() => window.close(), 3000);
-        </script>
-      </body>
-    </html>
-  `);
+// Step 2: Handle the OAuth2 callback and show popup success (with token exchange)
+app.get('/callback', async (req, res) => {
+  const { code, realmId, state } = req.query;
+  if (!code || !realmId) {
+    return res.status(400).send('Missing code or realmId');
+  }
+  try {
+    // Exchange code for tokens
+    const tokenResponse = await oauthClient.createToken(req.url);
+    const tokens = tokenResponse.getJson();
+
+    // Render a page that notifies the opener and closes the popup
+    res.send(`
+      <html>
+        <body>
+          <h1>QuickBooks Connected Successfully!</h1>
+          <p>You can close this window and return to the dashboard.</p>
+          <script>
+            if (window.opener) {
+              window.opener.postMessage({
+                type: 'qbo_connected',
+                access_token: '${tokens.access_token}',
+                refresh_token: '${tokens.refresh_token}',
+                realmId: '${realmId}'
+              }, '*');
+            }
+            setTimeout(() => window.close(), 3000);
+          </script>
+        </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error('OAuth callback error:', err.response?.data || err.message);
+    res.status(400).send('OAuth callback error: ' + (err.response?.data?.error_description || err.message));
+  }
 });
 
 // Test endpoint to create a customer in QBO
